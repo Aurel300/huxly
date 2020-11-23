@@ -1,6 +1,6 @@
-package huxley;
+package huxly;
 
-@:autoBuild(huxley.Parser.build())
+@:autoBuild(huxly.Parser.build())
 class Parser<T> {
   public static macro function build();
 }

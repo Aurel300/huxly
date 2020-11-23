@@ -1,4 +1,4 @@
-package huxley;
+package huxly;
 
 import haxe.ds.Either;
 import haxe.macro.Context;
@@ -18,17 +18,27 @@ class Parser {
     }
     if (!symbols.exists("main"))
       Context.fatalError("main parser not found", Context.currentPos());
-    symbols = [ for (id => parser in symbols) id => resolveSymbols(parser, symbols) ];
+    //symbols = [ for (id => parser in symbols) id => resolveSymbols(parser, symbols) ];
+
+    var forwardDecls = [];
+    var defs = [];
     for (id => parser in symbols) {
+      var e = compile(optimise(parser));
       Sys.println(id);
-      Sys.println(printer.printExpr(compile(optimise(parser))));
+      Sys.println(printer.printExpr(e));
+      forwardDecls.push(macro var $id = null);
+      defs.push(macro $i{id} = () -> $e);
     }
-    var main = compile(optimise(symbols["main"]));
-    var parseBytes = (macro class {
-      public static function parseBytes(_huxley_input:haxe.io.Bytes)
-        return $main;
-    }).fields[0];
-    return [parseBytes];
+    var parseBytes = [macro var _huxly_inputPos = 0]
+      .concat(forwardDecls)
+      .concat(defs)
+      .concat([macro return main()]);
+    var ret = (macro class {
+      public static function parseBytes(_huxly_input:haxe.io.Bytes)
+        $b{parseBytes}
+    }).fields;
+    Sys.println(printer.printField(ret[0]));
+    return ret;
   }
 
   static var printer = new haxe.macro.Printer();
@@ -47,6 +57,7 @@ class Parser {
         case EBinop(OpShr, a, b): Right(walk(a), walk(b));
         case EBinop(OpMult, a, b): Apply(walk(a), walk(b));
         case EBinop(OpOr, a, b): Alternative(walk(a), walk(b));
+        case ECall({expr: EConst(CIdent("pure"))}, [e]): Pure(e);
         case ECall({expr: EConst(CIdent("string"))}, [{expr: EConst(CString(v))}]):
           var res = macro $v{v};
           for (i in 0...v.length) {
@@ -69,6 +80,7 @@ class Parser {
               res;
             });
           else Context.fatalError("invalid char", e.pos);
+        case ECall({expr: EConst(CIdent("branch"))}, [b, l, r]): Branch(walk(b), walk(l), walk(r));
         case EParenthesis(e): return walk(e);
         case ETry(e, []): Try(walk(e));
         case _: Context.fatalError("invalid parser", e.pos);
@@ -77,6 +89,7 @@ class Parser {
     return walk(e);
   }
 
+  /*
   static function resolveSymbols(parser:ParserExpr, symbols:Map<String, ParserExpr>):ParserExpr {
     return {expr: parser.expr, ast: (switch (parser.ast) {
       case Symbol(ident):
@@ -96,6 +109,7 @@ class Parser {
       case _: parser.ast;
     })};
   }
+  */
 
   static final F_ID = macro e -> e;
   static function mk(ast:ParserAst<ParserExpr>):ParserExpr {
@@ -176,8 +190,12 @@ class Parser {
       return ret;
     }
     var vars = [];
+    function freshNoDecl(?type:ComplexType):Expr {
+      var name = '_huxly_var${varCtr++}';
+      return macro $i{name};
+    }
     function fresh(?type:ComplexType):Expr {
-      var name = '_huxley_var${varCtr++}';
+      var name = '_huxly_var${varCtr++}';
       vars.push({
         expr: EVars([{
           name: name,
@@ -190,6 +208,10 @@ class Parser {
     }
     function c(parser:ParserExpr):Void {
       switch (parser.ast) {
+        case Symbol(id):
+          var slot = fresh();
+          stack.push(slot);
+          into.push(macro $slot = $i{id}());
         case Pure(e): // stack -> Type(e), stack
           var slot = fresh();
           stack.push(slot);
@@ -197,28 +219,28 @@ class Parser {
         case Satisfy(e): // stack -> Int, stack
           var slot = fresh((macro : Int));
           stack.push(slot);
-          var char = macro _huxley_input.get(_huxley_inputPos >= _huxley_input.length ? throw "eof" : _huxley_inputPos++);
+          var char = macro _huxly_input.get(_huxly_inputPos >= _huxly_input.length ? throw "eof" : _huxly_inputPos++);
           into.push(macro $slot = $char);
           into.push(macro if (!$e{e(slot)}) throw "unsat");
         case Try(p):
           var p = scope(() -> c(p));
           var pos = fresh((macro : Int));
-          into.push(macro $pos = _huxley_inputPos);
-          into.push(macro try $b{p} catch (e:Dynamic) { _huxley_inputPos = $pos; throw "fail"; });
+          into.push(macro $pos = _huxly_inputPos);
+          into.push(macro try $b{p} catch (e:Dynamic) { _huxly_inputPos = $pos; throw "fail"; });
         case Look(p):
           var pos = fresh((macro : Int));
-          into.push(macro $pos = _huxley_inputPos);
+          into.push(macro $pos = _huxly_inputPos);
           c(p);
           //stack.pop();
-          into.push(macro _huxley_inputPos = $pos);
+          into.push(macro _huxly_inputPos = $pos);
         case NegLook(p):
           var pos = fresh((macro : Int));
-          into.push(macro $pos = _huxley_inputPos);
+          into.push(macro $pos = _huxly_inputPos);
           var p = scope(() -> c(p));
           stack.pop();
           stack.push(null);
           p.push(macro true);
-          into.push(macro if (try $b{p} catch (e:Dynamic) { _huxley_inputPos = $pos; false; }) throw "neglook fail");
+          into.push(macro if (try $b{p} catch (e:Dynamic) { _huxly_inputPos = $pos; false; }) throw "neglook fail");
         case Apply(l, r): // stack -> Type(r), Type(l), stack -> Type(l(r)), stack
           c(l);
           var f = stack.pop();
@@ -239,15 +261,32 @@ class Parser {
           var res = fresh();
           var l = scope(() -> c(l));
           var lRes = stack.pop();
-          l.push(macro $res = haxe.ds.Either.Left($lRes));
+          l.push(macro $res = $lRes);
           var r = scope(() -> c(r));
           var rRes = stack.pop();
-          r.push(macro $res = haxe.ds.Either.Right($rRes));
+          r.push(macro $res = $rRes);
           var pos = fresh((macro : Int));
-          into.push(macro $pos = _huxley_inputPos);
+          into.push(macro $pos = _huxly_inputPos);
           stack.push(res);
-          r.unshift(macro if (_huxley_inputPos != $pos) throw e);
+          r.unshift(macro if (_huxly_inputPos != $pos) throw e);
           into.push(macro try $b{l} catch (e:Dynamic) $b{r});
+        case Branch(b, l, r):
+          c(b);
+          var either = stack.pop();
+          var leftSrc = freshNoDecl();
+          stack.push(leftSrc);
+          var l = scope(() -> c(l));
+          var leftRes = stack.pop();
+          var rightSrc = freshNoDecl();
+          stack.push(rightSrc);
+          var r = scope(() -> c(r));
+          var rightRes = stack.pop();
+          var res = fresh();
+          stack.push(res);
+          into.push(macro $res = (switch ($either) {
+            case Left($leftSrc): $b{l}; $leftRes;
+            case Right($rightSrc): $b{r}; $rightRes;
+          }));
         case Empty: // stack -> null, stack
           stack.push(macro null);
           into.push(macro throw "empty");
@@ -256,7 +295,6 @@ class Parser {
     }
     c(parser);
     into = vars.concat(into);
-    into.unshift(macro var _huxley_inputPos = 0);
     into.push(stack[stack.length - 1]);
     return macro $b{into};
   }
