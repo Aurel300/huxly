@@ -5,10 +5,6 @@ package huxly.internal;
 class Optimiser {
   static final F_ID = macro e -> e;
 
-  static function mk(ast:Ast.AstKind<Ast>):Ast {
-    return {expr: null, ast: ast};
-  }
-
   /**
     Optimises a parser AST to simpler terms.
    */

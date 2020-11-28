@@ -6,5 +6,9 @@ import haxe.macro.Context;
 import haxe.macro.Expr;
 
 using huxly.internal.AstTools;
+import huxly.internal.AstTools.mk;
+
+using Lambda;
+using StringTools;
 
 #end

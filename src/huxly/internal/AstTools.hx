@@ -3,6 +3,10 @@ package huxly.internal;
 #if macro
 
 class AstTools {
+  public static function mk(ast:Ast.AstKind<Ast>):Ast {
+    return {expr: null, ast: ast};
+  }
+
   public static function map(ast:Ast):Ast {
     return {expr: ast.expr, ast: (switch (ast.ast) {
       case Try(p): Try(map(p));

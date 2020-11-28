@@ -37,6 +37,7 @@ class Parser {
       public static function parseBytes(_huxly_input:haxe.io.Bytes)
         $b{parseBytes}
     }).fields;
+    // TODO: allow statics and other non-parser fields
     return ret;
   }
 
