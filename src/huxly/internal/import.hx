@@ -10,5 +10,6 @@ import huxly.internal.AstTools.mk;
 
 using Lambda;
 using StringTools;
+using huxly.internal.ArrayTools;
 
 #end

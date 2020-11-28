@@ -2,12 +2,17 @@ package huxly.internal;
 
 #if macro
 
+import huxly.internal.Cfg.CfgVar;
+import huxly.internal.Cfg.CfgBody;
+
 class Compiler {
   /**
     Compiles a parser AST into a Haxe expression.
    */
   public static function compile(parser:Ast):Expr {
     var res = astToCfg(parser);
+    res.cfg = optimiseEmpty(res.cfg);
+    optimiseCheckChars(res.cfg);
     //simplify(res.cfg);
     //propagateChars(res.cfg);
     //cfg.dump();
@@ -19,18 +24,10 @@ class Compiler {
   static function astToCfg(ast:Ast):{vars:Array<CfgVar>, cfg:Cfg} {
     var varCtr = 0;
     var vars:Array<CfgVar> = [];
-    function fresh(init:Expr):CfgVar {
-      var name = '_huxly_var${varCtr++}';
+    function fresh(isInt:Bool):CfgVar {
       var ret:CfgVar = {
-        decl: {
-          expr: EVars([{
-            name: name,
-            type: null, // type,
-            expr: init,
-          }]),
-          pos: Context.currentPos(),
-        },
-        ident: macro $i{name},
+        id: varCtr++,
+        isInt: isInt,
         used: false,
       };
       vars.push(ret);
@@ -39,25 +36,21 @@ class Compiler {
     var compiled:Map<Ast, Cfg> = [];
     Cfg.blockCtr = 0;
     var handlers:Array<Cfg> = [new Cfg()];
-    handlers[0].body = macro throw "fail";
-    function topHandler():Cfg return handlers[handlers.length - 1];
-    function error():Expr {
-      return macro {
-        _huxly_state = $v{topHandler().id};
-        continue;
-      };
-    }
-    function write(v:CfgVar):Expr {
-      return v.ident;
-    }
-    function read(v:CfgVar):Expr {
-      v.used = true;
-      return v.ident;
-    }
+    handlers[0].body = Fail;
     function c(a:Ast, prev:Cfg):Cfg {
-      function mk(link:Null<Cfg>):Cfg {
+      function mk(link:Null<Cfg>, body:CfgBody, ?res:CfgVar):Cfg {
         var ret = new Cfg();
-        ret.error = topHandler();
+        ret.error = handlers[handlers.length - 1];
+        ret.body = body;
+        if (body != null) switch (body) {
+          case CheckPos(v): v.used = true;
+          case AssignVar(_, src): src.used = true;
+          case Apply(_, l, r): l.used = r.used = true;
+          case SetPos(v): v.used = true;
+          case Return(v): v.used = true;
+          case _:
+        }
+        ret.result = res;
         if (link != null) {
           link.link(ret);
         }
@@ -73,178 +66,195 @@ class Compiler {
         case Symbol(id):
           // TODO: stack frames, TCO
           //c(symbols[id], prev);
-          var ret = mk(prev);
-          ret.result = fresh(macro null);
-          ret.body = macro try $e{write(ret.result)} = $i{id}() catch (e:Dynamic) $e{error()};
-          ret;
+          var res = fresh(false);
+          mk(prev, Call(res, id), res);
+        case Pure(e = {expr:
+          EConst(CIdent("true" | "false" | "null") | CInt(_) | CFloat(_) | CString(_)) | EFunction(_, _)
+        }):
+          // TODO: better inlinability check
+          var res = fresh(false);
+          res.inlineExpr = e;
+          mk(prev, None, res);
         case Pure(e):
-          var ret = mk(prev);
-          ret.result = fresh(macro null);
-          ret.body = macro $e{write(ret.result)} = $e;
-          ret;
+          var res = fresh(false);
+          mk(prev, AssignPure(res, e), res);
         case Satisfy(e):
-          var ret = mk(prev);
-          ret.result = fresh(macro 0);
-          ret.needChars = 1;
-          var assign = macro $e{write(ret.result)} = _huxly_input.get(_huxly_inputPos++);
-          ret.body = macro if (!$e{e(assign)}) $e{error()};
-          ret;
+          var res = fresh(true);
+          var pre = mk(prev, CheckChars(1));
+          mk(pre, CheckSatisfy(res, e), res);
         case Try(p):
-          var pos = fresh(macro 0);
-          var pre = mk(prev);
-          pre.body = macro $e{write(pos)} = _huxly_inputPos;
-          var handler = mk(null);
-          handler.body = macro {
-            _huxly_inputPos = $e{read(pos)};
-            $e{error()};
-          };
+          var pos = fresh(true);
+          var pre = mk(prev, GetPos(pos));
+          var handler = mk(null, SetPos(pos));
+          mk(handler, Fail);
           handlers.push(handler);
           var mid = c(p, pre);
           handlers.pop();
-          var post = mk(mid);
-          handler.link(post);
-          post.result = mid.result;
-          post;
+          mk(mid, None, mid.result);
         case Look(p):
-          var pos = fresh(macro 0);
-          var pre = mk(prev);
-          pre.body = macro $e{write(pos)} = _huxly_inputPos;
+          var pos = fresh(true);
+          var pre = mk(prev, GetPos(pos));
           var mid = c(p, pre);
-          var post = mk(mid);
-          post.body = macro _huxly_inputPos = $e{read(pos)};
-          post.result = mid.result;
-          post;
+          mk(mid, SetPos(pos), mid.result);
         case NegLook(p):
-          var handler = mk(null);
-          handler.result = null;
+          var handler = mk(null, None);
           handlers.push(handler);
           var mid = c(p, prev);
           handlers.pop();
-          var post = mk(mid);
-          post.result = null;
-          post.body = error();
+          mk(mid, Fail);
           handler;
         case Apply(l, r):
+          var res = fresh(false);
           var l = c(l, prev);
           var r = c(r, l);
-          var post = mk(r);
-          post.result = fresh(macro null);
-          post.body = macro $e{write(post.result)} = $e{read(l.result)}($e{read(r.result)});
-          post;
+          mk(r, Apply(res, l.result, r.result), res);
         case Left(l, r):
           var l = c(l, prev);
           var r = c(r, l);
-          var post = mk(r);
-          post.result = l.result;
-          post;
+          mk(r, None, l.result);
         case Right(l, r):
           var l = c(l, prev);
           c(r, l);
         case Alternative(l, r):
-          var pos = fresh(macro 0);
-          var res = fresh(macro null);
-          var pre = mk(prev);
-          pre.body = macro $e{write(pos)} = _huxly_inputPos;
-          var handler = mk(null);
-          handler.body = macro if (_huxly_inputPos != $e{read(pos)}) $e{error()};
+          var pos = fresh(true);
+          var res = fresh(false);
+          var pre = mk(prev, GetPos(pos));
+          var handler = mk(null, CheckPos(pos));
           handlers.push(handler);
           var l = c(l, pre);
           handlers.pop();
-          var postL = mk(l);
-          postL.body = macro $e{write(res)} = $e{read(l.result)};
+          var postL = mk(l, AssignVar(res, l.result));
           var r = c(r, handler);
-          var postR = mk(r);
-          postR.body = macro $e{write(res)} = $e{read(r.result)};
-          var post = mk(postL);
+          var postR = mk(r, AssignVar(res, r.result));
+          var post = mk(postL, None, res);
           postR.link(post);
-          post.result = res;
           post;
         case Empty:
-          var ret = mk(prev);
-          ret.result = null;
-          ret.body = error();
-          ret;
+          mk(prev, Fail);
         case _: throw "!"; null;
       });
     }
     var initial = new Cfg();
+    initial.body = None;
     var body = c(ast, initial);
     var last = new Cfg();
     body.link(last);
-    last.body = macro return $e{read(body.result)};
+    body.result.used = true;
+    last.body = Return(body.result);
     return {vars: vars, cfg: initial};
   }
 
-  static function simplify(cfg:Cfg):Void {
-    var seen = new Map();
-    var queue = [cfg];
-    function mergeExpr(a:Expr, b:Expr):Expr {
-      if (a == null) return b;
-      if (b == null) return a;
-      return (switch [a.expr, b.expr] {
-        case [EBlock(as), EBlock(bs)]: {expr: EBlock(as.concat(bs)), pos: a.pos};
-        case [EBlock(as), _]: {expr: EBlock(as.concat([b])), pos: a.pos};
-        case [_, EBlock(bs)]: {expr: EBlock([a].concat(bs)), pos: a.pos};
-        case [_, _]: {expr: EBlock([a, b]), pos: a.pos};
-      });
-    }
-    while (queue.length > 0) {
-      var curr = queue.shift();
-      if (seen[curr.id]) continue;
-      seen[curr.id] = true;
-      if (curr.next.length == 1 && curr.next[0].prev.length == 1 && curr.error == curr.next[0].error) {
-        var next = curr.next[0];
-        curr.body = mergeExpr(curr.body, next.body);
-        curr.needChars += next.needChars;
-        curr.next = next.next;
-        for (b in next.next) b.prev = b.prev.map(op -> op == next ? curr : op);
-        if (curr.error != null) curr.error.prev.remove(next);
-        queue.push(curr);
-        seen[curr.id] = false;
-      }
-      if (curr.error != null && !seen[curr.error.id]) queue.push(curr.error);
-      for (n in curr.next) if (!seen[n.id]) queue.push(n);
-    }
+  static function optimiseEmpty(root:Cfg):Cfg {
+    var ret = root;
+    root.iter(cfg -> {
+      if (cfg.body != None || cfg.next == null) return;
+      if (cfg == ret) ret = cfg.next;
+      cfg.remove();
+    });
+    return ret;
   }
 
-  /*
-  static function propagateChars(cfg:Cfg):Void {
-    cfg.iter(cfg -> {
-      if (cfg.needChars > 0) {
-        var curr = cfg;
-        while (curr.prev.length == 1 && curr.prev[0].next.length == 1 && curr.error == curr.prev[0].error) {
-          curr.prev[0].needChars += curr.needChars;
-          curr.needChars = 0;
-          curr = curr.prev[0];
-        }
+  static function optimiseCheckChars(root:Cfg):Void {
+    var queue = [];
+    root.iter(cfg -> {
+      if (cfg.body.match(CheckChars(_))) {
+        queue.push(cfg);
       }
     });
+    while (queue.length > 0) {
+      var curr = queue.pop();
+      var currN = (switch (curr.body) {
+        case CheckChars(n): n;
+        case _: throw "!";
+      });
+      while (curr.prev.length == 1 && curr.error == curr.prev[0].error) {
+        var prev = curr.prev[0];
+        switch (prev.body) {
+          case CheckChars(n):
+            prev.body = CheckChars(n + currN);
+            if (queue.indexOf(prev) == -1) queue.push(prev);
+            curr.remove();
+            break;
+          case CheckSatisfy(_) | AssignVar(_, _): Cfg.swap(prev, curr);
+          case _: break;
+        }
+      }
+    }
   }
-  */
 
   static function cfgToExpr(vars:Array<CfgVar>, cfg:Cfg):Expr {
-    var cases = [];
-    function walk(e:Expr):Expr {
-      return (switch (e.expr) {
-        case EBinop(OpAssign, {expr: EConst(CIdent(id))}, init):
-          if (!id.startsWith("_huxly_var"))
-            return e;
-          var cfgVar = vars[Std.parseInt(id.substr("_huxly_var".length))];
-          if (!cfgVar.used)
-            return init;
-          trace(id, cfgVar.used);
-          e;
-        case _: haxe.macro.ExprTools.map(e, walk);
-      });
+    for (v in vars) {
+      if (v.used) {
+        v.name = '_huxly_var${v.id}';
+        v.ident = macro $i{v.name};
+      }
     }
-    cfg.iter(cfg -> {
-      var body = [];
-      if (cfg.needChars > 0) body.push(macro if (_huxly_inputPos + $v{cfg.needChars} > _huxly_input.length) {
+    function read(v:CfgVar):Expr {
+      if (v.inlineExpr != null)
+        return v.inlineExpr;
+      return v.ident;
+    }
+    function write(v:CfgVar, e:Expr):Expr {
+      if (v.inlineExpr != null) throw "cannot write to inlined var";
+      if (v.used)
+        return macro $e{v.ident} = $e;
+      return e;
+    }
+    var cases = [];
+    var generated = new Map();
+    function error(cfg:Cfg):Expr {
+      return cfg.error != null ? macro {
         _huxly_state = $v{cfg.error.id};
         continue;
-      });
-      if (cfg.body != null) body.push(walk(cfg.body));
-      if (cfg.next.length > 0) body.push(macro $v{cfg.next[0].id});
+      } : macro throw "fail";
+    }
+    cfg.iter(cfg -> {
+      if (generated[cfg.id]) return;
+      var body = [];
+      var curr = cfg;
+      do {
+        generated[curr.id] = true;
+        if (curr.body != None) body.push(switch (curr.body) {
+          //*
+          case CheckChars(_) | CheckSatisfy(_, _) | CheckPos(_):
+            var cond = macro false;
+            var advance = 0;
+            do {
+              generated[curr.id] = true;
+              cond = macro $cond || $e{(switch (curr.body) {
+                case CheckChars(n): macro _huxly_inputPos + $v{n} > _huxly_input.length;
+                case CheckSatisfy(v, e): macro !($e{e(write(v, macro _huxly_input.get(_huxly_inputPos + $v{advance++})))});
+                case CheckPos(v): macro _huxly_inputPos != $e{read(v)};
+                case _: throw "!";
+              })};
+              if (curr.next == null
+                || curr.next.prev.length != 1
+                || !curr.next.body.match(CheckChars(_) | CheckSatisfy(_, _) | CheckPos(_))
+                || curr.error != curr.next.error) break;
+              curr = curr.next;
+            } while (curr != null && curr.prev.length == 1);
+            macro if ($cond) $e{error(curr)} else _huxly_inputPos += $v{advance};
+          /*/
+          case CheckChars(n): macro if (_huxly_inputPos + $v{n} > _huxly_input.length) $e{error(curr)};
+          case CheckSatisfy(v, e):
+            var assign = write(v, macro _huxly_input.get(_huxly_inputPos++));
+            macro if (!$e{e(assign)}) $e{error(curr)};
+          case CheckPos(v): macro if (_huxly_inputPos != $e{read(v)}) $e{error(curr)};
+          //*/
+          case AssignPure(v, e): write(v, e);
+          case AssignVar(v, src): write(v, read(src));
+          case Apply(v, l, r): write(v, macro $e{read(l)}($e{read(r)}));
+          case Call(v, id): write(v, macro try $i{id}() catch (e:Dynamic) $e{error(curr)});
+          case GetPos(v): write(v, macro _huxly_inputPos);
+          case SetPos(v): macro _huxly_inputPos = $e{read(v)};
+          case Return(v): macro return $e{read(v)};
+          case Fail: error(curr);
+          case _: throw "!";
+        });
+        if (curr.next == null || curr.next.prev.length != 1) break;
+        curr = curr.next;
+      } while (curr != null && curr.prev.length == 1);
+      body.push(curr.next != null ? macro $v{curr.next.id} : macro -1);
       cases.push({
         values: [macro $v{cfg.id}],
         guard: null,
@@ -254,66 +264,14 @@ class Compiler {
     var switchExpr = {expr: ESwitch(macro _huxly_state, cases, macro return null), pos: Context.currentPos()};
     var block = [];
     block.push(macro var _huxly_state = $v{cfg.id});
-    for (v in vars) if (v.used) block.push(v.decl);
+    block.push({expr: EVars([ for (v in vars) if (v.used) {
+      name: v.name,
+      type: v.isInt ? (macro : Int) : null,
+      expr: v.isInt ? macro 0 : macro null,
+    } ]), pos: Context.currentPos()});
     block.push(macro while (true) _huxly_state = $switchExpr);
     block.push(macro return null);
     return macro $b{block};
-  }
-}
-
-typedef CfgVar = {
-  decl:Expr,
-  ident:Expr,
-  used:Bool,
-};
-
-class Cfg {
-  public static var blockCtr = 0;
-
-  public var id:Int;
-  public var result:CfgVar = null;
-  public var body:Expr;
-  public var error:Null<Cfg>;
-  public var needChars:Int = 0;
-  public var prev:Array<Cfg> = [];
-  public var next:Array<Cfg> = [];
-
-  public function new() {
-    id = blockCtr++;
-  }
-
-  public function link(then:Cfg):Void {
-    next.push(then);
-    then.prev.push(this);
-  }
-
-  public function iter(f:Cfg->Void):Void {
-    var seen = new Map();
-    var queue = [this];
-    while (queue.length > 0) {
-      var curr = queue.shift();
-      if (seen[curr.id]) continue;
-      seen[curr.id] = true;
-      f(curr);
-      if (curr.error != null && !seen[curr.error.id]) queue.push(curr.error);
-      for (n in curr.next) if (!seen[n.id]) queue.push(n);
-    }
-  }
-
-  public function dump():Void {
-    var printer = new haxe.macro.Printer();
-    iter(curr -> {
-      Sys.println('// block ${curr.id}');
-      if (curr.needChars > 0) Sys.println('// need chars: ${curr.needChars}');
-      if (curr.body != null)
-        Sys.println(printer.printExpr(curr.body));
-      else
-        Sys.println("// no body");
-      if (curr.error != null) Sys.println('// error handler: ${curr.error.id}');
-      if (curr.result != null) Sys.println('// result: ${printer.printExpr(curr.result.ident)}');
-      if (curr.next.length > 0) Sys.println('// next: ${curr.next.map(b -> b.id).join(", ")}');
-      Sys.println("");
-    });
   }
 }
 
