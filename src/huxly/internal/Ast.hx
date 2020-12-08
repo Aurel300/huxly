@@ -9,7 +9,9 @@ typedef Ast = {
 
 enum AstKind<T> {
   Symbol(_:String);
+  Reg(_:Int);
   Pure(_:Expr);
+  Impure(_:Expr);
   Satisfy(_:Expr->Expr);
   Try(_:T);
   Look(_:T);
@@ -20,6 +22,9 @@ enum AstKind<T> {
   Alternative(l:T, r:T);
   Empty;
   Branch(b:T, l:T, r:T);
+  Let(reg:Int, init:Expr, _:T);
+  Recurse(index:Int);
+  Fixpoint(index:Int, _:T);
 }
 
 #end

@@ -1,0 +1,4 @@
+--library utest
+-cp ../src
+--main Main
+--interp

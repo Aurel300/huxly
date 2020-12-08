@@ -6,7 +6,7 @@ class Optimiser {
   static final F_ID = macro e -> e;
 
   /**
-    Optimises a parser AST to simpler terms.
+    Optimises a parser AST to simpler/fewer terms.
    */
   public static function optimise(parser:Ast):Ast {
     return optimise(mk(switch (parser.ast) {

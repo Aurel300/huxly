@@ -16,9 +16,11 @@ enum CfgBody {
   CheckChars(n:Int);
   CheckSatisfy(v:CfgVar, e:Expr->Expr);
   CheckPos(v:CfgVar);
-  AssignPure(v:CfgVar, e:Expr);
+  AssignExpr(v:CfgVar, e:Expr);
   AssignVar(v:CfgVar, src:CfgVar);
   Apply(v:CfgVar, l:CfgVar, r:CfgVar);
+  FixpointCall(stack:CfgVar, ret:Cfg);
+  FixpointReturn(stack:CfgVar);
   Call(v:CfgVar, id:String);
   GetPos(v:CfgVar);
   SetPos(v:CfgVar);
@@ -28,15 +30,16 @@ enum CfgBody {
 
 class Cfg {
   public static function swap(a:Cfg, b:Cfg):Void {
-    if (a.next != b || b.prev.length != 1 || b.prev[0] != a || a.error != b.error) throw "cannot swap";
+    if (a.jumpTarget || b.jumpTarget) throw "cannot swap jump target";
+    if (a.next.length != 1 || a.next[0] != b || b.prev.length != 1 || b.prev[0] != a || a.error != b.error) throw "cannot swap";
     var origPrev = a.prev;
     var origNext = b.next;
     a.next = origNext;
     a.prev = [b];
-    b.next = a;
+    b.next = [a];
     b.prev = origPrev;
-    for (p in origPrev) p.next = b;
-    if (origNext != null) origNext.prev = origNext.prev.replace(b, a);
+    for (p in origPrev) p.next = p.next.replace(a, b);
+    for (n in origNext) n.prev = n.prev.replace(b, a);
   }
 
   public static var blockCtr = 0;
@@ -46,31 +49,35 @@ class Cfg {
   public var body:CfgBody;
   public var error:Null<Cfg>;
   public var prev:Array<Cfg> = [];
-  public var next:Cfg;
+  public var next:Array<Cfg> = [];
+  public var jumpTarget:Bool = false;
 
   public function new() {
     id = blockCtr++;
   }
 
   public function link(then:Cfg):Void {
-    if (next != null) throw "duplicate next link";
-    next = then;
+    next.push(then);
     then.prev.push(this);
   }
 
   public function remove():Void {
-    if (next == null) {
+    if (jumpTarget) throw "cannot remove jump target";
+    if (next.length == 0) {
       for (p in prev) {
-        p.next = null;
+        p.next.remove(this);
       }
       return;
     }
-    next.prev.remove(this);
-    for (p in prev) {
-      if (next.prev.indexOf(p) == -1)
-        next.prev.push(p);
-      p.next = next;
+    var n = next[0];
+    if (prev.length == 0) {
+      n.prev.remove(this);
+      return;
     }
+    if (next.length != 1 || prev.length != 1) throw "cannot remove";
+    var p = prev[0];
+    n.prev = n.prev.replace(this, p);
+    p.next = p.next.replace(this, n);
   }
 
   public function iter(f:Cfg->Void):Void {
@@ -82,7 +89,9 @@ class Cfg {
       seen[curr.id] = true;
       f(curr);
       if (curr.error != null && !seen[curr.error.id]) queue.push(curr.error);
-      if (curr.next != null && !seen[curr.next.id]) queue.push(curr.next);
+      for (n in curr.next) {
+        if (n != null && !seen[n.id]) queue.push(n);
+      }
     }
   }
 

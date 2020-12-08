@@ -10,18 +10,17 @@ class Compiler {
     Compiles a parser AST into a Haxe expression.
    */
   public static function compile(parser:Ast):Expr {
-    var res = astToCfg(parser);
+    var res = astToCfg(Optimiser.optimise(parser));
     res.cfg = optimiseEmpty(res.cfg);
+    //checkLinks(res.cfg);
     optimiseCheckChars(res.cfg);
-    //simplify(res.cfg);
-    //propagateChars(res.cfg);
-    //cfg.dump();
-    var expr = cfgToExpr(res.vars, res.cfg);
+    //res.cfg.dump();
+    var expr = cfgToExpr(res.vars, res.regs, res.cfg);
     //Sys.println(new haxe.macro.Printer().printExpr(expr));
     return expr;
   }
 
-  static function astToCfg(ast:Ast):{vars:Array<CfgVar>, cfg:Cfg} {
+  static function astToCfg(ast:Ast):{vars:Array<CfgVar>, regs:Map<Int, CfgVar>, cfg:Cfg} {
     var varCtr = 0;
     var vars:Array<CfgVar> = [];
     function fresh(isInt:Bool):CfgVar {
@@ -33,10 +32,11 @@ class Compiler {
       vars.push(ret);
       return ret;
     }
-    var compiled:Map<Ast, Cfg> = [];
     Cfg.blockCtr = 0;
     var handlers:Array<Cfg> = [new Cfg()];
     handlers[0].body = Fail;
+    var regs:Map<Int, CfgVar> = [];
+    var fixpoints:Map<Int, {retStack:CfgVar, retVar:CfgVar, cfg:Cfg, post:Cfg}> = [];
     function c(a:Ast, prev:Cfg):Cfg {
       function mk(link:Null<Cfg>, body:CfgBody, ?res:CfgVar):Cfg {
         var ret = new Cfg();
@@ -46,6 +46,7 @@ class Compiler {
           case CheckPos(v): v.used = true;
           case AssignVar(_, src): src.used = true;
           case Apply(_, l, r): l.used = r.used = true;
+          case FixpointCall(stack, ret): stack.used = true;
           case SetPos(v): v.used = true;
           case Return(v): v.used = true;
           case _:
@@ -56,12 +57,6 @@ class Compiler {
         }
         return ret;
       }
-      // TODO: caching
-      /*var cached = compiled[a];
-      if (cached != null) {
-        if (cached.prev.indexOf(prev) == -1) cached.prev.push(prev);
-        return cached;
-      }*/
       return (switch (a.ast) {
         case Symbol(id):
           // TODO: stack frames, TCO
@@ -75,9 +70,9 @@ class Compiler {
           var res = fresh(false);
           res.inlineExpr = e;
           mk(prev, None, res);
-        case Pure(e):
+        case Pure(e) | Impure(e):
           var res = fresh(false);
-          mk(prev, AssignPure(res, e), res);
+          mk(prev, AssignExpr(res, e), res);
         case Satisfy(e):
           var res = fresh(true);
           var pre = mk(prev, CheckChars(1));
@@ -131,24 +126,62 @@ class Compiler {
           post;
         case Empty:
           mk(prev, Fail);
+        case Let(reg, init, p):
+          regs[reg] = fresh(false);
+          regs[reg].used = true;
+          var pre = mk(prev, AssignExpr(regs[reg], init), regs[reg]);
+          c(p, pre);
+        case Reg(reg):
+          var res = fresh(false);
+          res.used = true; // TODO: registers are not resolved until later, need a separate variable usage stage
+          mk(prev, AssignVar(res, regs[reg]), res);
+        case Fixpoint(index, p):
+          var retStack = fresh(false);
+          var retVar = fresh(false);
+          var jumpTarget = mk(null, None, retVar);
+          var pre = mk(prev, AssignExpr(retStack, macro [$v{jumpTarget.id}]));
+          var pre2 = mk(pre, None);
+          var post = mk(null, FixpointReturn(retStack), retVar);
+          fixpoints[index] = {
+            retStack: retStack,
+            retVar: retVar,
+            cfg: pre2,
+            post: post,
+          };
+          var ret = c(p, pre2);
+          var retPost = mk(ret, AssignVar(retVar, ret.result), null);
+          retPost.link(post);
+          fixpoints.remove(index);
+          post.link(jumpTarget);
+          jumpTarget;
+        case Recurse(index):
+          if (!fixpoints.exists(index)) throw "!";
+          var jumpTarget = mk(null, None, fixpoints[index].retVar);
+          jumpTarget.jumpTarget = true;
+          var pre = mk(prev, FixpointCall(fixpoints[index].retStack, jumpTarget));
+          pre.link(fixpoints[index].cfg);
+          fixpoints[index].post.link(jumpTarget);
+          jumpTarget;
         case _: throw "!"; null;
       });
     }
     var initial = new Cfg();
     initial.body = None;
     var body = c(ast, initial);
-    var last = new Cfg();
-    body.link(last);
-    body.result.used = true;
-    last.body = Return(body.result);
-    return {vars: vars, cfg: initial};
+    if (body.result != null) {
+      var last = new Cfg();
+      body.link(last);
+      body.result.used = true;
+      last.body = Return(body.result);
+    }
+    return {vars: vars, regs: regs, cfg: initial};
   }
 
   static function optimiseEmpty(root:Cfg):Cfg {
     var ret = root;
     root.iter(cfg -> {
-      if (cfg.body != None || cfg.next == null) return;
-      if (cfg == ret) ret = cfg.next;
+      if (cfg.body != None || cfg.next.length != 1 || cfg.prev.length != 1) return;
+      if (cfg == ret) ret = cfg.next[0];
       cfg.remove();
     });
     return ret;
@@ -182,7 +215,20 @@ class Compiler {
     }
   }
 
-  static function cfgToExpr(vars:Array<CfgVar>, cfg:Cfg):Expr {
+  static function checkLinks(root:Cfg):Void {
+    root.iter(cfg -> {
+      var expected = (switch (cfg.body) {
+        case FixpointReturn(_): -1;
+        case Return(v): 0;
+        case Fail: 0;
+        case _: 1;
+      });
+      if (expected == -1) return;
+      if (cfg.next.length != expected) throw 'next link count mismatch ${cfg.id}';
+    });
+  }
+
+  static function cfgToExpr(vars:Array<CfgVar>, regs:Map<Int, CfgVar>, cfg:Cfg):Expr {
     for (v in vars) {
       if (v.used) {
         v.name = '_huxly_var${v.id}';
@@ -200,6 +246,10 @@ class Compiler {
         return macro $e{v.ident} = $e;
       return e;
     }
+    function writeNA(v:CfgVar):Expr {
+      if (v.inlineExpr != null) throw "cannot write to inlined var";
+      return v.ident;
+    }
     var cases = [];
     var generated = new Map();
     function error(cfg:Cfg):Expr {
@@ -208,6 +258,20 @@ class Compiler {
         continue;
       } : macro throw "fail";
     }
+    function resolveRegisters(e:Expr):Expr {
+      return (switch (e) {
+        case macro _huxly_registers[$n]:
+          var reg = (switch (n.expr) {
+            case EConst(CInt(Std.parseInt(_) => reg)): reg;
+            case _: throw "!";
+          });
+          if (!regs.exists(reg)) throw "!";
+          read(regs[reg]);
+        case _: e.map(resolveRegisters);
+      });
+    }
+    final fuseBlocks = true;
+    final fuseConditions = true;
     cfg.iter(cfg -> {
       if (generated[cfg.id]) return;
       var body = [];
@@ -215,35 +279,37 @@ class Compiler {
       do {
         generated[curr.id] = true;
         if (curr.body != None) body.push(switch (curr.body) {
-          //*
           case CheckChars(_) | CheckSatisfy(_, _) | CheckPos(_):
             var cond = macro false;
+            var require = 0;
             var advance = 0;
             do {
               generated[curr.id] = true;
-              cond = macro $cond || $e{(switch (curr.body) {
-                case CheckChars(n): macro _huxly_inputPos + $v{n} > _huxly_input.length;
-                case CheckSatisfy(v, e): macro !($e{e(write(v, macro _huxly_input.get(_huxly_inputPos + $v{advance++})))});
-                case CheckPos(v): macro _huxly_inputPos != $e{read(v)};
+              switch (curr.body) {
+                case CheckChars(n): require += n;
+                case CheckSatisfy(v, e): cond = macro $cond || !($e{e(write(v, macro _huxly_input.get(_huxly_inputPos + $v{advance++})))});
+                case CheckPos(v): cond = macro $cond || _huxly_inputPos != $e{read(v)};
                 case _: throw "!";
-              })};
-              if (curr.next == null
-                || curr.next.prev.length != 1
-                || !curr.next.body.match(CheckChars(_) | CheckSatisfy(_, _) | CheckPos(_))
-                || curr.error != curr.next.error) break;
-              curr = curr.next;
+              }
+              if (!fuseConditions) break;
+              if (curr.next.length != 1
+                || curr.next[0].prev.length != 1
+                || !curr.next[0].body.match(CheckChars(_) | CheckSatisfy(_, _) | CheckPos(_))
+                || curr.error != curr.next[0].error) break;
+              curr = curr.next[0];
             } while (curr != null && curr.prev.length == 1);
-            macro if ($cond) $e{error(curr)} else _huxly_inputPos += $v{advance};
-          /*/
-          case CheckChars(n): macro if (_huxly_inputPos + $v{n} > _huxly_input.length) $e{error(curr)};
-          case CheckSatisfy(v, e):
-            var assign = write(v, macro _huxly_input.get(_huxly_inputPos++));
-            macro if (!$e{e(assign)}) $e{error(curr)};
-          case CheckPos(v): macro if (_huxly_inputPos != $e{read(v)}) $e{error(curr)};
-          //*/
-          case AssignPure(v, e): write(v, e);
+            if (require > 0) cond = macro _huxly_inputPos + $v{require} > _huxly_input.length || $cond;
+            advance > 0
+              ? macro if ($cond) $e{error(curr)} else _huxly_inputPos += $v{advance}
+              : macro if ($cond) $e{error(curr)};
+          case AssignExpr(v, e): write(v, e);
           case AssignVar(v, src): write(v, read(src));
           case Apply(v, l, r): write(v, macro $e{read(l)}($e{read(r)}));
+          case FixpointCall(stack, ret): macro $e{writeNA(stack)}.push($v{ret.id});
+          case FixpointReturn(stack): macro {
+              _huxly_state = $e{read(stack)}.pop();
+              continue;
+            };
           case Call(v, id): write(v, macro try $i{id}() catch (e:Dynamic) $e{error(curr)});
           case GetPos(v): write(v, macro _huxly_inputPos);
           case SetPos(v): macro _huxly_inputPos = $e{read(v)};
@@ -251,14 +317,15 @@ class Compiler {
           case Fail: error(curr);
           case _: throw "!";
         });
-        if (curr.next == null || curr.next.prev.length != 1) break;
-        curr = curr.next;
+        if (!fuseBlocks) break;
+        if (curr.next.length != 1 || curr.next[0].prev.length != 1) break;
+        curr = curr.next[0];
       } while (curr != null && curr.prev.length == 1);
-      body.push(curr.next != null ? macro $v{curr.next.id} : macro -1);
+      body.push(curr.next.length == 1 ? macro $v{curr.next[0].id} : macro -1);
       cases.push({
         values: [macro $v{cfg.id}],
         guard: null,
-        expr: macro $b{body},
+        expr: resolveRegisters(macro $b{body}),
       });
     });
     var switchExpr = {expr: ESwitch(macro _huxly_state, cases, macro return null), pos: Context.currentPos()};

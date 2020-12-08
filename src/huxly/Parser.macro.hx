@@ -5,21 +5,55 @@ import haxe.macro.Expr;
 import huxly.internal.*;
 
 class Parser {
+  static var printer = new haxe.macro.Printer();
+
   public static function build():Array<Field> {
-    var symbols = new Map();
+    var rawSymbols = [];
     for (field in Context.getBuildFields()) {
       switch (field.kind) {
-        case FVar(null, e):
-          if (symbols.exists(field.name))
-            Context.fatalError("duplicate field", field.pos);
-          symbols[field.name] = AstParser.parse(e);
+        // TODO: allow statics and other non-parser fields
+        case FVar(null, e): rawSymbols.push({name: field.name, expr: e});
         case _: Context.fatalError("only vars are allowed", field.pos);
       }
+    }
+    return (macro class {
+      public static function parseBytes(_huxly_input:haxe.io.Bytes)
+        $e{buildSyntax(rawSymbols)}
+      public static function parseString(s:String)
+        return parseBytes(haxe.io.Bytes.ofString(s));
+    }).fields;
+  }
+
+  public static function ofSyntax(syntax:Expr):Expr {
+    var rawSymbols = [];
+    switch (syntax.expr) {
+      case EBlock(es) if (es.length > 0):
+        for (expr in es) switch (expr.expr) {
+          case EVars(vars):
+            for (v in vars) {
+              if (v.expr == null) Context.fatalError("expected expression", expr.pos);
+              rawSymbols.push({name: v.name, expr: v.expr});
+            }
+          case _: Context.fatalError("invalid syntax", expr.pos);
+        }
+      case _:
+        rawSymbols.push({name: "main", expr: syntax});
+    }
+    return macro new huxly.InlineParser(function (_huxly_input:haxe.io.Bytes) {
+      $e{buildSyntax(rawSymbols)}
+    });
+  }
+
+  static function buildSyntax(rawSymbols:Array<{name:String, expr:Expr}>):Expr {
+    var symbols = new Map();
+    for (s in rawSymbols) {
+      if (symbols.exists(s.name))
+        Context.fatalError("duplicate field", s.expr.pos);
+      symbols[s.name] = AstParser.parse(s.expr);
     }
     if (!symbols.exists("main"))
       Context.fatalError("main parser not found", Context.currentPos());
     //symbols = [ for (id => parser in symbols) id => resolveSymbols(parser, symbols) ];
-
     var forwardDecls = [];
     var defs = [];
     for (id => parser in symbols) {
@@ -33,35 +67,6 @@ class Parser {
       .concat(forwardDecls)
       .concat(defs)
       .concat([macro return main()]);
-    var ret = (macro class {
-      public static function parseBytes(_huxly_input:haxe.io.Bytes)
-        $b{parseBytes}
-    }).fields;
-    // TODO: allow statics and other non-parser fields
-    return ret;
+    return macro $b{parseBytes};
   }
-
-  static var printer = new haxe.macro.Printer();
-
-  /*
-  static function resolveSymbols(parser:ParserExpr, symbols:Map<String, ParserExpr>):ParserExpr {
-    return {expr: parser.expr, ast: (switch (parser.ast) {
-      case Symbol(ident):
-        var res = symbols[ident];
-        if (res != null)
-          return res;
-        // Context.fatalError('no such symbol: ${ident}', parser.expr.pos);
-        Pure(macro $i{ident});
-      case Try(p): Try(resolveSymbols(p, symbols));
-      case Look(p): Look(resolveSymbols(p, symbols));
-      case NegLook(p): NegLook(resolveSymbols(p, symbols));
-      case Apply(l, r): Apply(resolveSymbols(l, symbols), resolveSymbols(r, symbols));
-      case Left(l, r): Left(resolveSymbols(l, symbols), resolveSymbols(r, symbols));
-      case Right(l, r): Right(resolveSymbols(l, symbols), resolveSymbols(r, symbols));
-      case Alternative(l, r): Alternative(resolveSymbols(l, symbols), resolveSymbols(r, symbols));
-      case Branch(b, l, r): Branch(resolveSymbols(b, symbols), resolveSymbols(l, symbols), resolveSymbols(r, symbols));
-      case _: parser.ast;
-    })};
-  }
-  */
 }
