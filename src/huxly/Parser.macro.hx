@@ -8,6 +8,8 @@ class Parser {
   static var printer = new haxe.macro.Printer();
 
   public static function build():Array<Field> {
+    var cls = Context.getLocalClass().get();
+    var returnType = haxe.macro.TypeTools.toComplexType(cls.superClass.params[0]);
     var rawSymbols = [];
     for (field in Context.getBuildFields()) {
       switch (field.kind) {
@@ -17,9 +19,9 @@ class Parser {
       }
     }
     return (macro class {
-      public static function parseBytes(_huxly_input:haxe.io.Bytes)
+      public static function parseBytes(_huxly_input:haxe.io.Bytes):$returnType
         $e{buildSyntax(rawSymbols)}
-      public static function parseString(s:String)
+      public static function parseString(s:String):$returnType
         return parseBytes(haxe.io.Bytes.ofString(s));
     }).fields;
   }
@@ -66,7 +68,7 @@ class Parser {
     var parseBytes = [macro var _huxly_inputPos = 0]
       .concat(forwardDecls)
       .concat(defs)
-      .concat([macro return main()]);
+      .concat([macro @:pos(symbols["main"].expr.pos) return main()]);
     return macro $b{parseBytes};
   }
 }
