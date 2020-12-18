@@ -139,6 +139,7 @@ class Compiler {
           var retStack = fresh(false);
           var retVar = fresh(false);
           var jumpTarget = mk(null, None, retVar);
+          jumpTarget.jumpTarget = true;
           var pre = mk(prev, AssignExpr(retStack, macro [$v{jumpTarget.id}]));
           var pre2 = mk(pre, None);
           var post = mk(null, FixpointReturn(retStack), retVar);
@@ -180,7 +181,7 @@ class Compiler {
   static function optimiseEmpty(root:Cfg):Cfg {
     var ret = root;
     root.iter(cfg -> {
-      if (cfg.body != None || cfg.next.length != 1 || cfg.prev.length != 1) return;
+      if (cfg.body != None || cfg.next.length != 1 || cfg.prev.length != 1 || cfg.jumpTarget) return;
       if (cfg == ret) ret = cfg.next[0];
       cfg.remove();
     });
@@ -276,8 +277,10 @@ class Compiler {
       if (generated[cfg.id]) return;
       var body = [];
       var curr = cfg;
+      var lastBlockNext = macro -1;
       do {
         generated[curr.id] = true;
+        lastBlockNext = macro -1;
         if (curr.body != None) body.push(switch (curr.body) {
           case CheckChars(_) | CheckSatisfy(_, _) | CheckPos(_):
             var cond = macro false;
@@ -306,14 +309,16 @@ class Compiler {
           case AssignVar(v, src): write(v, read(src));
           case Apply(v, l, r): write(v, macro $e{read(l)}($e{read(r)}));
           case FixpointCall(stack, ret): macro $e{writeNA(stack)}.push($v{ret.id});
-          case FixpointReturn(stack): macro {
-              _huxly_state = $e{read(stack)}.pop();
-              continue;
-            };
+          case FixpointReturn(stack):
+            lastBlockNext = macro $e{read(stack)}.pop();
+            break;
           case Call(v, id): write(v, macro try $i{id}() catch (e:Dynamic) $e{error(curr)});
           case GetPos(v): write(v, macro _huxly_inputPos);
           case SetPos(v): macro _huxly_inputPos = $e{read(v)};
           case Return(v): macro return $e{read(v)};
+          case Fail if (curr.error != null):
+            lastBlockNext = macro $v{curr.error.id};
+            break;
           case Fail: error(curr);
           case _: throw "!";
         });
@@ -321,7 +326,7 @@ class Compiler {
         if (curr.next.length != 1 || curr.next[0].prev.length != 1) break;
         curr = curr.next[0];
       } while (curr != null && curr.prev.length == 1);
-      body.push(curr.next.length == 1 ? macro $v{curr.next[0].id} : macro -1);
+      body.push(curr.next.length == 1 ? macro $v{curr.next[0].id} : lastBlockNext);
       cases.push({
         values: [macro $v{cfg.id}],
         guard: null,

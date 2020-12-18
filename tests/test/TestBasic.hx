@@ -1,8 +1,6 @@
 package test;
 
-import huxly.Parser;
 import huxly.Parser.ofSyntax as p;
-import haxe.io.Bytes;
 
 class TestBasic extends Test {
   function testDefinitionVariants() {
@@ -61,6 +59,6 @@ class TestBasic extends Test {
 }
 
 // for testDefinitionVariants
-class TestBasicClassVariant extends Parser<Int> {
+class TestBasicClassVariant extends huxly.Parser<Int> {
   var main = pure(123);
 }

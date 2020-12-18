@@ -56,11 +56,56 @@ class AstParser {
         case [_, EConst(CIdent(lookupReg(_) => reg))] if (reg != null): Reg(reg);
         case [_, EConst(CIdent(lookupFixpoint(_) => index))] if (index != null): Recurse(index);
         case [_, EConst(CIdent(STDLIB_IDENT[_] => stdlib))] if (stdlib != null): stdlib;
+        case [macro manyMin($e, $_), ECall(_, [_, {expr: EConst(CInt(Std.parseInt(_) => min))}])]:
+          var reg = varCtr++;
+          var index = fixpointCtr++;
+          // let(r = [], <pe> >> <pe> >> ... >> fixpoint(rec, (try <pe> >> rec) | pure(r)))
+          // where pe = pure(r.push) * <e>
+          var e = parse(e);
+          var rec = mk(Fixpoint(
+            index,
+            mk(Alternative(
+              mk(Try(
+                mk(Right(
+                  mk(Apply(
+                    mk(Pure(macro _huxly_registers[$v{reg}].push)),
+                    e
+                  )),
+                  mk(Recurse(index))
+                ))
+              )),
+              mk(Reg(reg))
+            ))
+          ));
+          for (i in 0...min) {
+            rec = mk(Right(
+              mk(Apply(
+                mk(Pure(macro _huxly_registers[$v{reg}].push)),
+                e
+              )),
+              rec
+            ));
+          }
+          Let(reg, macro [], rec);
+        case [macro many($e), _]: return parse(macro manyMin($e, 0));
+        case [macro some($e), _]: return parse(macro manyMin($e, 1));
+        case [macro endBy($e, $end), _]: return parse(macro many($e << $end));
+        case [macro sepBy($e, $sep), _]: return parse(macro (try arrayPrepend($e, many($sep >> $e))) | pure([]));
         case [_, EConst(CIdent(ident))]: Symbol(ident);
         case [macro $a << $b, _]: Left(parse(a), parse(b));
         case [macro $a >> $b, _]: Right(parse(a), parse(b));
         case [macro $a * $b, _]: Apply(parse(a), parse(b));
         case [macro $a | $b, _]: Alternative(parse(a), parse(b));
+        case [macro arrayPrepend($a, $b), _]: // parsec <:>
+          // pure(a -> b -> { b.unshift(a); b }) * <a> * <b>
+          Apply(
+            mk(Apply(
+              // cast required because Array<Array<T>> and Array<T> don't unify...
+              mk(Pure(macro a -> (b:Array<Any>) -> { b.unshift(a); cast b; })),
+              parse(a)
+            )),
+            parse(b)
+          );
         case [macro pure($e), _]: Pure(resolveRegisters(e));
         case [macro impure($e), _]: Impure(resolveRegisters(e));
         case [_, ECall({expr: EConst(CIdent("string"))}, [{expr: EConst(CString(v))}])]:
@@ -94,6 +139,18 @@ class AstParser {
               macro { var _cc = $e; $res; };
             });
           else Context.fatalError("invalid char", e.pos);
+        case [_, ECall({expr: EConst(CIdent("noneOf"))}, [{expr: EConst(CString(c))}])]:
+          if (c.length == 1)
+            Satisfy(e -> macro $e != $v{c.charCodeAt(0)});
+          else if (c.length > 1)
+            Satisfy(e -> {
+              var res = macro false;
+              for (i in 0...c.length) {
+                res = macro $res || _cc == $v{c.charCodeAt(i)};
+              }
+              macro { var _cc = $e; !$res; };
+            });
+          else Context.fatalError("invalid noneOf", e.pos);
         case [macro branch($b, $l, $r), _]: Branch(parse(b), parse(l), parse(r));
         case [macro let($i{ident} = $init, $p), _]:
           init = resolveRegisters(init);
